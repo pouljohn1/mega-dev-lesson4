@@ -1,0 +1,123 @@
+# Preview: renders rig's /digest/<night> page inside CI and publishes it as one static HTML file
+# on GitHub Pages. The banner shows the LANE_MARKER secret; run again with the secret unset to
+# take the marker off the same link. The preview is never committed to the repo, put in issues
+# or printed in logs (ADR 0003). It only exists as a short-lived Pages artifact.
+name: preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      night:
+        description: Night to render (YYYY-MM-DD)
+        required: true
+        default: '2026-10-28'
+        type: string
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Check night input
+        env:
+          NIGHT: ${{ inputs.night }}
+        run: |
+          if [[ ! "$NIGHT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "::error::night must be YYYY-MM-DD"
+            exit 1
+          fi
+
+      - name: Start rig
+        env:
+          LANE_MARKER: ${{ secrets.LANE_MARKER }}
+        run: |
+          setsid pnpm start > "$RUNNER_TEMP/rig.log" 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/rig.pid"
+
+      - name: Wait for /health
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -fsS -o /dev/null localhost:8787/health 2>/dev/null; then
+              echo "rig is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::rig did not answer /health within 30 s"
+          tail -n 20 "$RUNNER_TEMP/rig.log"
+          exit 1
+
+      - name: Render digest
+        env:
+          NIGHT: ${{ inputs.night }}
+        run: |
+          mkdir _site
+          curl -fsS "localhost:8787/digest/${NIGHT}" -o _site/index.html
+
+      - name: Stop rig
+        if: always()
+        run: |
+          if [[ -f "$RUNNER_TEMP/rig.pid" ]]; then
+            kill -- "-$(cat "$RUNNER_TEMP/rig.pid")" 2>/dev/null || true
+          fi
+
+      - name: Check preview
+        run: |
+          f=_site/index.html
+          if [[ ! -s "$f" ]]; then
+            echo "::error::preview is empty"
+            exit 1
+          fi
+          if grep -qi '<script' "$f"; then
+            echo "::error::preview contains a <script> tag (ADR 0001)"
+            exit 1
+          fi
+          if grep -Eqi "(src|href)[[:space:]]*=[[:space:]]*[\"']?[[:space:]]*(https?:)?//" "$f"; then
+            echo "::error::preview loads an external resource (ADR 0001)"
+            exit 1
+          fi
+          if grep -q 'no marker set' "$f"; then
+            echo "banner: no marker set"
+          else
+            echo "banner: marker set"
+          fi
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+          retention-days: 1
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
