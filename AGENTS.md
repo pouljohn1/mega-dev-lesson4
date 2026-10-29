@@ -41,3 +41,4 @@ here (a link or a config entry). Don't copy: copies drift.
 - Never commit `.env`, tokens or previews.
 - Don't touch `runs/`: those are real nights, read-only fixtures.
 - No client JS (ADR 0001).
+- Commit `pnpm-lock.yaml` with every dependency change, in the same commit.
